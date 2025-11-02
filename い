@@ -1,0 +1,224 @@
+import {
+  events,
+  ticketTypes,
+  applications,
+  applicationTickets,
+  type Event,
+  type InsertEvent,
+  type TicketType,
+  type InsertTicketType,
+  type Application,
+  type InsertApplication,
+  type EventWithTickets,
+  type ApplicationWithTickets,
+} from "@shared/schema";
+import { db } from "./db";
+import { eq, and, desc } from "drizzle-orm";
+
+export interface IStorage {
+  // Event operations
+  createEvent(event: InsertEvent, tickets: Omit<InsertTicketType, "eventId">[]): Promise<EventWithTickets>;
+  getEvent(id: string): Promise<EventWithTickets | undefined>;
+  getAllEvents(): Promise<EventWithTickets[]>;
+  updateEvent(id: string, event: Partial<InsertEvent>): Promise<Event>;
+
+  // Application operations
+  createApplication(
+    application: InsertApplication,
+    ticketTypeIds: string[]
+  ): Promise<Application>;
+  getApplicationsByEvent(eventId: string): Promise<ApplicationWithTickets[]>;
+  getApplicationByDeviceAndEvent(
+    deviceFingerprint: string,
+    eventId: string
+  ): Promise<Application | undefined>;
+  updateApplicationStatus(
+    id: string,
+    status: "pending" | "approved" | "rejected"
+  ): Promise<Application>;
+  getApplication(id: string): Promise<ApplicationWithTickets | undefined>;
+
+  // Ticket type operations
+  getTicketTypesByEvent(eventId: string): Promise<TicketType[]>;
+}
+
+export class DatabaseStorage implements IStorage {
+  async createEvent(
+    insertEvent: InsertEvent,
+    tickets: Omit<InsertTicketType, "eventId">[]
+  ): Promise<EventWithTickets> {
+    const [event] = await db.insert(events).values(insertEvent).returning();
+
+    const ticketTypesData = tickets.map((ticket) => ({
+      ...ticket,
+      eventId: event.id,
+    }));
+
+    const createdTickets = await db
+      .insert(ticketTypes)
+      .values(ticketTypesData)
+      .returning();
+
+    return {
+      ...event,
+      ticketTypes: createdTickets,
+    };
+  }
+
+  async getEvent(id: string): Promise<EventWithTickets | undefined> {
+    const [event] = await db.select().from(events).where(eq(events.id, id));
+    if (!event) return undefined;
+
+    const tickets = await db
+      .select()
+      .from(ticketTypes)
+      .where(eq(ticketTypes.eventId, id));
+
+    return {
+      ...event,
+      ticketTypes: tickets,
+    };
+  }
+
+  async getAllEvents(): Promise<EventWithTickets[]> {
+    const allEvents = await db.select().from(events).orderBy(desc(events.createdAt));
+
+    const eventsWithTickets = await Promise.all(
+      allEvents.map(async (event) => {
+        const tickets = await db
+          .select()
+          .from(ticketTypes)
+          .where(eq(ticketTypes.eventId, event.id));
+
+        return {
+          ...event,
+          ticketTypes: tickets,
+        };
+      })
+    );
+
+    return eventsWithTickets;
+  }
+
+  async updateEvent(id: string, eventData: Partial<InsertEvent>): Promise<Event> {
+    const [updated] = await db
+      .update(events)
+      .set(eventData)
+      .where(eq(events.id, id))
+      .returning();
+    return updated;
+  }
+
+  async createApplication(
+    insertApplication: InsertApplication,
+    ticketTypeIds: string[]
+  ): Promise<Application> {
+    const [application] = await db
+      .insert(applications)
+      .values(insertApplication)
+      .returning();
+
+    const ticketData = ticketTypeIds.map((ticketTypeId) => ({
+      applicationId: application.id,
+      ticketTypeId,
+    }));
+
+    await db.insert(applicationTickets).values(ticketData);
+
+    return application;
+  }
+
+  async getApplicationsByEvent(eventId: string): Promise<ApplicationWithTickets[]> {
+    const eventApplications = await db
+      .select()
+      .from(applications)
+      .where(eq(applications.eventId, eventId))
+      .orderBy(desc(applications.appliedAt));
+
+    const applicationsWithTickets = await Promise.all(
+      eventApplications.map(async (application) => {
+        const appTickets = await db
+          .select({
+            ticketType: ticketTypes,
+          })
+          .from(applicationTickets)
+          .innerJoin(
+            ticketTypes,
+            eq(applicationTickets.ticketTypeId, ticketTypes.id)
+          )
+          .where(eq(applicationTickets.applicationId, application.id));
+
+        return {
+          ...application,
+          tickets: appTickets.map((at) => at.ticketType),
+        };
+      })
+    );
+
+    return applicationsWithTickets;
+  }
+
+  async getApplicationByDeviceAndEvent(
+    deviceFingerprint: string,
+    eventId: string
+  ): Promise<Application | undefined> {
+    const [application] = await db
+      .select()
+      .from(applications)
+      .where(
+        and(
+          eq(applications.deviceFingerprint, deviceFingerprint),
+          eq(applications.eventId, eventId)
+        )
+      );
+
+    return application || undefined;
+  }
+
+  async updateApplicationStatus(
+    id: string,
+    status: "pending" | "approved" | "rejected"
+  ): Promise<Application> {
+    const [updated] = await db
+      .update(applications)
+      .set({ status, updatedAt: new Date() })
+      .where(eq(applications.id, id))
+      .returning();
+
+    return updated;
+  }
+
+  async getApplication(id: string): Promise<ApplicationWithTickets | undefined> {
+    const [application] = await db
+      .select()
+      .from(applications)
+      .where(eq(applications.id, id));
+
+    if (!application) return undefined;
+
+    const appTickets = await db
+      .select({
+        ticketType: ticketTypes,
+      })
+      .from(applicationTickets)
+      .innerJoin(
+        ticketTypes,
+        eq(applicationTickets.ticketTypeId, ticketTypes.id)
+      )
+      .where(eq(applicationTickets.applicationId, application.id));
+
+    return {
+      ...application,
+      tickets: appTickets.map((at) => at.ticketType),
+    };
+  }
+
+  async getTicketTypesByEvent(eventId: string): Promise<TicketType[]> {
+    return await db
+      .select()
+      .from(ticketTypes)
+      .where(eq(ticketTypes.eventId, eventId));
+  }
+}
+
+export const storage = new DatabaseStorage();
